@@ -1,0 +1,35 @@
+# Copy to catalog.yaml (next to this file) or ~/.config/discographer/catalog.yaml
+# then edit library, jobs, and optional drive offsets.
+
+library: ~/Music
+staging: ~/.cache/discographer
+
+# Optional. If omitted, every /dev/sr* is used with offset 6.
+# Look up your drive on http://www.accuraterip.com/driveoffsets.htm
+# drives:
+#   sr0:
+#     path: /dev/sr0
+#     name: HL-DT-ST DVDRAM SP80NB60
+#     offset: 6
+
+defaults:
+  genre: ""
+  composer: ""
+
+jobs:
+  dark-side:
+    album: The Dark Side of the Moon
+    author: Pink Floyd
+    year: 1973
+    discs: 1
+
+  series-vol1:
+    series: Example Series
+    author: Example Artist
+    author_dir: true
+    book: 1
+    title: First Volume
+    part: 1
+    parts: 2
+    discs: 3
+    year: 2001
