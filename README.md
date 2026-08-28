@@ -1,4 +1,4 @@
-# discographer
+# Discographer
 
 Accurate CD ripper for one optical drive or a fleet of them. Each drive is an independent lane: a slow disc on `sr0` does not block `sr1`. Output is one **FLAC image + CUE + log per disc**, tagged from a YAML catalog instead of retyped at the tray.
 
