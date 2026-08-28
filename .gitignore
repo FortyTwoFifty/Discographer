@@ -11,3 +11,4 @@ state.yaml.lock
 *.lock
 *.wav
 staging/
+.cache/
