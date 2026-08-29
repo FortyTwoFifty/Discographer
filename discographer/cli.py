@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import shutil
 import sys
 from pathlib import Path
 
@@ -14,11 +13,13 @@ from discographer.catalog import (
     mark_failed,
     mark_pending,
     mark_ripped,
+    mark_skipped,
+    mark_unskipped,
     save_state,
     scan_job,
 )
 from discographer.cd import cddb_id, has_media, msf_stamp, query_toc, read_cdtext, rewrite_cue_header
-from discographer.rip import apply_tags, copy_verified, eject, rip_disc
+from discographer.rip import apply_tags, copy_verified, eject, remove_work_dir, rip_disc
 from discographer.tui import run_session
 
 
@@ -59,8 +60,12 @@ def cmd_status(cat: Catalog, args) -> int:
     print(f"discs    {job.discs}  ripped {st.ripped or '[]'}  next {st.next_disc}")
     if st.pending:
         print(f"pending  {st.pending}")
+    if st.skipped:
+        print(f"skipped  {st.skipped}")
     if remain:
         print(f"todo     {remain}")
+    elif st.skipped:
+        print(f"todo     done ({len(st.skipped)} skipped)")
     else:
         print("todo     done")
     return 0
@@ -71,9 +76,10 @@ def cmd_jobs(cat: Catalog, args) -> int:
         st = cat.state_for(jid)
         mark = "*" if jid == cat.current else " "
         remain = len(cat.remaining(job))
+        skip = f"  skipped={st.skipped}" if st.skipped else ""
         print(
             f"{mark} {jid:16}  {job.album_name()}  "
-            f"{len(st.ripped)}/{job.discs}  next={st.next_disc}  left={remain}"
+            f"{len(st.ripped)}/{job.discs}  next={st.next_disc}  left={remain}{skip}"
         )
     return 0
 
@@ -99,9 +105,10 @@ def cmd_scan(cat: Catalog, args) -> int:
         jobs = [cat.job(args.job)] if args.job else list(cat.jobs.values())
         for job in jobs:
             st = scan_job(cat, job)
+            extra = f"  skipped {st.skipped}" if st.skipped else ""
             print(
                 f"{job.id}: ripped {st.ripped or '[]'}  next {st.next_disc}  "
-                f"{job.album_name()}"
+                f"{job.album_name()}{extra}"
             )
         save_state(cat)
     finally:
@@ -174,12 +181,19 @@ def cmd_rip(cat: Catalog, args) -> int:
         job = cat.job(args.job)
         drive = _resolve_drive(cat, args.drive)
         remain = cat.remaining(job)
+        st = cat.state_for(job.id)
         if args.disc is not None:
             disc = args.disc
         elif remain:
             disc = remain[0]
         else:
-            print(f"{job.id} complete ({job.discs} discs)")
+            if st.skipped:
+                print(
+                    f"{job.id} complete ({len(st.ripped)}/{job.discs} ripped, "
+                    f"skipped {st.skipped})"
+                )
+            else:
+                print(f"{job.id} complete ({job.discs} discs)")
             return 0
         if not args.dry_run:
             mark_pending(cat, job, [disc])
@@ -251,12 +265,42 @@ def cmd_salvage(cat: Catalog, args) -> int:
             mark_ripped(cat, cat.job(job.id), disc)
         finally:
             lock.close()
-        shutil.rmtree(d)
+        remove_work_dir(d)
         print(f"ok disc {disc} -> {dest}")
     if not found:
         print("nothing to salvage")
         return 1
     return rc
+
+
+def cmd_skip(cat: Catalog, args) -> int:
+    lock = locked(cat.state_path)
+    try:
+        cat = load(cat.path, cat.state_path)
+        job = cat.job(args.job)
+        mark_skipped(cat, job, args.disc)
+    finally:
+        lock.close()
+    st = cat.state_for(job.id)
+    remain = cat.remaining(job)
+    print(f"skipped disc {args.disc} of {job.id} ({job.album_name()})")
+    print(f"  ripped {st.ripped or '[]'}  skipped {st.skipped}  left {remain or 'done'}")
+    return 0
+
+
+def cmd_unskip(cat: Catalog, args) -> int:
+    lock = locked(cat.state_path)
+    try:
+        cat = load(cat.path, cat.state_path)
+        job = cat.job(args.job)
+        if args.disc not in cat.state_for(job.id).skipped:
+            print(f"disc {args.disc} of {job.id} is not skipped")
+            return 0
+        mark_unskipped(cat, job, args.disc)
+    finally:
+        lock.close()
+    print(f"unskipped disc {args.disc} of {job.id} — it is remaining again")
+    return 0
 
 
 def cmd_retag(cat: Catalog, args) -> int:
@@ -365,6 +409,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sp.set_defaults(func=run_session)
     sub.add_parser("both", parents=[rip_opts], help="alias for session").set_defaults(func=run_session)
+
+    sp = sub.add_parser(
+        "skip",
+        help="mark a disc unreadable and continue the job without it",
+    )
+    sp.add_argument("disc", type=int, help="disc number")
+    sp.add_argument("job", nargs="?", help="job id (default: current)")
+    sp.set_defaults(func=cmd_skip)
+
+    sp = sub.add_parser("unskip", help="return a skipped disc to the remaining list")
+    sp.add_argument("disc", type=int, help="disc number")
+    sp.add_argument("job", nargs="?", help="job id (default: current)")
+    sp.set_defaults(func=cmd_unskip)
 
     sp = sub.add_parser("salvage", help="copy finished staging rips to the library (after a copy failure)")
     sp.add_argument("job", nargs="?")

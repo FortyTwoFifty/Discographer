@@ -9,9 +9,20 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
-from discographer.catalog import Catalog, Drive, Job, load, locked, mark_failed, mark_pending, mark_ripped, save_state
+from discographer.catalog import (
+    Catalog,
+    Drive,
+    Job,
+    load,
+    locked,
+    mark_failed,
+    mark_pending,
+    mark_ripped,
+    mark_skipped,
+    save_state,
+)
 from discographer.cd import has_media
-from discographer.rip import rip_disc
+from discographer.rip import RipCancelled, eject, rip_disc, signal_rip
 
 WORDS_PER_SECTOR = 1176
 CD_1X_WORDS = 44100 * 2
@@ -22,6 +33,9 @@ HIDE = "\033[?25l"
 SHOW = "\033[?25h"
 UP = "\033[{}A"
 CL = "\033[2K"
+RED = "\033[31m"
+GREEN = "\033[32m"
+RESET = "\033[0m"
 
 
 def parse_cb(line: str) -> tuple[int, str, int] | None:
@@ -137,7 +151,7 @@ class Row:
 
 class Board:
     def __init__(self, rows: list[Row]):
-        self.note = "Enter=start loaded idle drives   j=change idle job   q=quit"
+        self.note = "Enter=start loaded idle drives   j=job   x=cancel   s=skip   q=quit"
         self.rows = {r.drive_id: r for r in rows}
         self.order = [r.drive_id for r in rows]
         self.lock = threading.Lock()
@@ -156,9 +170,12 @@ class Board:
             if r.err:
                 lines.append(f"  Disc {r.disc}/{r.discs}  FAIL  {r.err[:50]}")
             elif r.phase == "wait_load":
-                flag = "ready" if r.ready else "empty"
+                if r.ready:
+                    flag = f"{GREEN}[ready]{RESET}"
+                else:
+                    flag = f"{RED}[empty]{RESET}"
                 lines.append(
-                    f"  put Disc {r.disc} of {r.discs}  then Enter  [{flag}]"
+                    f"  put Disc {r.disc} of {r.discs}  then Enter  {flag}"
                 )
             elif r.phase == "idle":
                 lines.append("  idle")
@@ -318,10 +335,11 @@ def pick_job(cat: Catalog, reason: str) -> Job | None:
     print()
     for i, (jid, job, left) in enumerate(options, 1):
         star = "*" if jid == cat.current else " "
-        print(
-            f"  {i}){star} {jid:12}  {job.album_name()}"
-            f"  next Disc {left[0]}/{job.discs}  ({len(left)} left)"
-        )
+        extra = f"next Disc {left[0]}/{job.discs}  ({len(left)} left)"
+        skipped = cat.state_for(jid).skipped
+        if skipped:
+            extra += f"  skipped {skipped}"
+        print(f"  {i}){star} {jid:12}  {job.album_name()}  {extra}")
     print("  j)  type a job id")
     print("  q)  quit")
     while True:
@@ -368,10 +386,15 @@ def _print_jobs(cat: Catalog) -> None:
     print("jobs:")
     for jid, job in cat.jobs.items():
         left = cat.remaining(job)
+        skipped = cat.state_for(jid).skipped
         if left:
             extra = f"next Disc {left[0]}/{job.discs}  ({len(left)} left)"
+        elif skipped:
+            extra = f"done (skipped {skipped})"
         else:
             extra = "done"
+        if left and skipped:
+            extra += f"  skipped {skipped}"
         print(f"  {jid:12}  {job.album_name()}  {extra}")
 
 
@@ -411,6 +434,9 @@ class Lane:
     disc: int | None = None
     busy: bool = False
     wait_load: bool = False
+    skip: bool = False
+    proc: object | None = None
+    cancel: threading.Event = field(default_factory=threading.Event)
 
 
 def _taken(lanes: list[Lane]) -> set[tuple[str, int]]:
@@ -419,6 +445,45 @@ def _taken(lanes: list[Lane]) -> set[tuple[str, int]]:
         if ln.job and ln.disc is not None and (ln.busy or ln.wait_load):
             out.add((ln.job.id, ln.disc))
     return out
+
+
+def _cmd_drive(key: str) -> tuple[str, str | None]:
+    parts = key.split()
+    if not parts:
+        return "", None
+    return parts[0].lower(), parts[1] if len(parts) > 1 else None
+
+
+def _pick_lane(
+    board: Board,
+    candidates: list[Lane],
+    did: str | None,
+    empty_note: str,
+) -> Lane | None:
+    if did:
+        ln = next((x for x in candidates if x.drive.id == did), None)
+        if ln is None:
+            board.set_note(f"no matching drive {did}")
+        return ln
+    if len(candidates) == 1:
+        return candidates[0]
+    if not candidates:
+        board.set_note(empty_note)
+        return None
+    board.close()
+    print("which drive?")
+    for ln in candidates:
+        extra = ""
+        if ln.job and ln.disc is not None:
+            extra = f"  Disc {ln.disc}/{ln.job.discs}"
+        print(f"  {ln.drive.id}{extra}")
+    try:
+        raw = input("drive> ").strip()
+    except EOFError:
+        board.start()
+        return None
+    board.start()
+    return next((x for x in candidates if x.drive.id == raw), None)
 
 
 def _arm_lane(cat: Catalog, board: Board, lanes: list[Lane], ln: Lane) -> bool:
@@ -486,13 +551,17 @@ def run_session(cat: Catalog, args) -> int:
     done_q: queue.Queue = queue.Queue()
     rows = [Row(drive_id=ln.drive.id, name=ln.drive.name) for ln in lanes]
     board = Board(rows)
-    HELP = "Enter=start loaded idle drives   j=change idle job   q=quit"
+    HELP = "Enter=start loaded idle drives   j=job   x=cancel   s=skip   q=quit"
     board.note = HELP
     board.start()
     last_poll = 0.0
     stop = False
 
-    def work(drive: Drive, job: Job, disc: int):
+    def work(ln: Lane):
+        drive = ln.drive
+        job = ln.job
+        disc = ln.disc
+        assert job is not None and disc is not None
         leadout_box = [1]
 
         def on_leadout(n: int):
@@ -521,6 +590,7 @@ def run_session(cat: Catalog, args) -> int:
                 return
             board.update(drive.id, phase, frac)
 
+        status = "ok"
         err = None
         try:
             rip_disc(
@@ -535,12 +605,25 @@ def run_session(cat: Catalog, args) -> int:
                 on_progress=on_progress,
                 on_line=on_line,
                 on_leadout=on_leadout,
+                cancel=ln.cancel,
+                on_proc=lambda p: setattr(ln, "proc", p),
             )
             board.update(drive.id, "done", 1.0)
+        except RipCancelled:
+            if ln.skip:
+                status = "skip"
+                err = "skipped"
+            else:
+                status = "cancel"
+                err = "cancelled"
+            board.update(drive.id, "fail", err=err)
         except Exception as e:
+            status = "fail"
             err = str(e)
             board.update(drive.id, "fail", err=err.splitlines()[0])
-        done_q.put((drive.id, job.id, disc, err))
+        finally:
+            ln.proc = None
+        done_q.put((drive.id, job.id, disc, status, err))
 
     def start_ready(force_check: bool) -> None:
         empty = []
@@ -560,6 +643,9 @@ def run_session(cat: Catalog, args) -> int:
                 lock.close()
             ln.busy = True
             ln.wait_load = False
+            ln.skip = False
+            ln.proc = None
+            ln.cancel.clear()
             board.set_lane(
                 ln.drive.id,
                 album=ln.job.album_name(),
@@ -567,27 +653,19 @@ def run_session(cat: Catalog, args) -> int:
                 discs=ln.job.discs,
                 phase="ripping",
             )
-            ex.submit(work, ln.drive, ln.job, ln.disc)
+            ex.submit(work, ln)
         if force_check and empty:
             board.set_note("empty: " + ", ".join(empty) + "  — load, then Enter")
         elif force_check:
             board.set_note(HELP)
 
-    def handle_done(drive_id: str, job_id: str, disc: int, err: str | None) -> None:
-        lock = locked(cat.state_path)
-        try:
-            fresh = load(cat.path, cat.state_path)
-            job = fresh.jobs[job_id]
-            if err:
-                mark_failed(fresh, job, disc)
-            else:
-                mark_ripped(fresh, job, disc)
-        finally:
-            lock.close()
-        ln = next(x for x in lanes if x.drive.id == drive_id)
+    def rearm(ln: Lane, job_id: str, note: str | None = None) -> None:
         ln.busy = False
         ln.wait_load = False
+        ln.skip = False
+        ln.proc = None
         ln.disc = None
+        ln.cancel.clear()
         cat2 = load(cat.path, cat.state_path)
         if ln.job is not None:
             ln.job = cat2.jobs[ln.job.id]
@@ -600,11 +678,62 @@ def run_session(cat: Catalog, args) -> int:
             board.start()
             if nxt is None:
                 board.set_lane(ln.drive.id, album="", disc=0, discs=0, phase="idle")
+                if note:
+                    board.set_note(note)
                 return
             _set_current(cat2, nxt)
             ln.job = nxt
             _arm_lane(load(cat.path, cat.state_path), board, lanes, ln)
-        board.set_note(HELP)
+        board.set_note(note or HELP)
+
+    def handle_done(drive_id: str, job_id: str, disc: int, status: str, err: str | None) -> None:
+        lock = locked(cat.state_path)
+        try:
+            fresh = load(cat.path, cat.state_path)
+            job = fresh.jobs[job_id]
+            if status == "ok":
+                mark_ripped(fresh, job, disc)
+            elif status == "skip":
+                mark_skipped(fresh, job, disc)
+            else:
+                mark_failed(fresh, job, disc)
+        finally:
+            lock.close()
+        ln = next(x for x in lanes if x.drive.id == drive_id)
+        if status == "cancel":
+            note = f"{ln.drive.id}  cancelled disc {disc}  — Enter to retry, s to skip"
+        elif status == "skip":
+            note = f"{ln.drive.id}  skipped disc {disc}  — load next, then Enter"
+        elif status == "fail":
+            note = f"{ln.drive.id}  FAIL disc {disc}  — Enter to retry, s to skip"
+        else:
+            note = HELP
+        rearm(ln, job_id, note)
+
+    def request_cancel(ln: Lane, skip: bool) -> None:
+        ln.skip = skip
+        ln.cancel.set()
+        if ln.proc is not None:
+            signal_rip(ln.proc)
+        if skip:
+            board.set_note(f"{ln.drive.id}  skipping disc {ln.disc}…")
+        else:
+            board.set_note(f"{ln.drive.id}  cancelling disc {ln.disc}…")
+
+    def skip_waiting(ln: Lane) -> None:
+        if ln.job is None or ln.disc is None:
+            return
+        job_id = ln.job.id
+        disc = ln.disc
+        lock = locked(cat.state_path)
+        try:
+            fresh = load(cat.path, cat.state_path)
+            mark_skipped(fresh, fresh.jobs[job_id], disc)
+        finally:
+            lock.close()
+        if not args.no_eject:
+            eject(ln.drive)
+        rearm(ln, job_id, f"{ln.drive.id}  skipped disc {disc}  — load next, then Enter")
 
     def change_idle_job() -> None:
         idle = [ln for ln in lanes if ln.wait_load or (not ln.busy and ln.job is None)]
@@ -636,81 +765,114 @@ def run_session(cat: Catalog, args) -> int:
         target.busy = False
         _arm_lane(load(cat.path, cat.state_path), board, lanes, target)
 
+    def abort_inflight() -> None:
+        for ln in lanes:
+            ln.cancel.set()
+            if ln.proc is not None:
+                signal_rip(ln.proc)
+
     try:
         with ThreadPoolExecutor(max_workers=max(1, len(lanes))) as ex:
-            for ln in lanes:
-                _arm_lane(cat, board, lanes, ln)
-            if not sys.stdin.isatty():
-                start_ready(True)
-            while True:
+            try:
+                for ln in lanes:
+                    _arm_lane(cat, board, lanes, ln)
+                if not sys.stdin.isatty():
+                    start_ready(True)
                 while True:
-                    try:
-                        item = done_q.get_nowait()
-                    except queue.Empty:
-                        break
-                    handle_done(*item)
-                now = time.monotonic()
-                if now - last_poll >= 1.0:
-                    last_poll = now
-                    for ln in lanes:
-                        if ln.wait_load:
-                            board.set_ready(ln.drive.id, has_media(ln.drive))
-                busy = any(ln.busy for ln in lanes)
-                waiting = any(ln.wait_load for ln in lanes)
-                if stop and not busy:
-                    break
-                if not busy and not waiting and not stop:
-                    board.close()
-                    nxt = pick_job(load(cat.path, cat.state_path), "All drives idle. Pick a job, or q.")
-                    if nxt is None:
-                        break
-                    _set_current(cat, nxt)
-                    for ln in lanes:
-                        if not ln.busy:
-                            ln.job = nxt
-                            _arm_lane(load(cat.path, cat.state_path), board, lanes, ln)
-                    board.start()
-                    continue
-                key = _wait_line(0.25)
-                if key is None:
-                    continue
-                key = key.strip()
-                if key.lower() in ("q", "quit"):
-                    if busy:
-                        board.set_note("waiting for in-flight rips to finish, then quit")
-                        stop = True
-                        for ln in lanes:
-                            ln.wait_load = False
-                        continue
-                    break
-                if stop:
-                    continue
-                if key.lower() in ("j", "job"):
-                    change_idle_job()
-                    continue
-                if key in cat.jobs or (key.isdigit() and int(key) >= 1):
-                    waiting_lanes = [ln for ln in lanes if ln.wait_load]
-                    if len(waiting_lanes) == 1:
+                    while True:
                         try:
-                            job = _resolve_job(
-                                load(cat.path, cat.state_path), key, waiting_lanes[0].job.id if waiting_lanes[0].job else None
+                            item = done_q.get_nowait()
+                        except queue.Empty:
+                            break
+                        handle_done(*item)
+                    now = time.monotonic()
+                    if now - last_poll >= 1.0:
+                        last_poll = now
+                        for ln in lanes:
+                            if ln.wait_load:
+                                board.set_ready(ln.drive.id, has_media(ln.drive))
+                    busy = any(ln.busy for ln in lanes)
+                    waiting = any(ln.wait_load for ln in lanes)
+                    if stop and not busy:
+                        break
+                    if not busy and not waiting and not stop:
+                        board.close()
+                        nxt = pick_job(load(cat.path, cat.state_path), "All drives idle. Pick a job, or q.")
+                        if nxt is None:
+                            break
+                        _set_current(cat, nxt)
+                        for ln in lanes:
+                            if not ln.busy:
+                                ln.job = nxt
+                                _arm_lane(load(cat.path, cat.state_path), board, lanes, ln)
+                        board.start()
+                        continue
+                    key = _wait_line(0.25)
+                    if key is None:
+                        continue
+                    key = key.strip()
+                    cmd, did = _cmd_drive(key)
+                    if cmd in ("q", "quit"):
+                        if busy:
+                            board.set_note(
+                                "waiting for in-flight rips to finish, then quit  (x=cancel  s=skip)"
                             )
-                        except ValueError:
-                            board.set_note(HELP)
+                            stop = True
+                            for ln in lanes:
+                                ln.wait_load = False
                             continue
-                        if job:
-                            waiting_lanes[0].job = job
-                            _set_current(cat, job)
-                            _arm_lane(load(cat.path, cat.state_path), board, lanes, waiting_lanes[0])
-                    continue
-                start_ready(True)
+                        break
+                    if cmd in ("x", "cancel"):
+                        busy_lanes = [ln for ln in lanes if ln.busy]
+                        target = _pick_lane(board, busy_lanes, did, "no rip to cancel")
+                        if target:
+                            request_cancel(target, skip=False)
+                        continue
+                    if cmd in ("s", "skip"):
+                        targets = [ln for ln in lanes if ln.busy or ln.wait_load]
+                        target = _pick_lane(board, targets, did, "no disc to skip")
+                        if target is None:
+                            continue
+                        if target.busy:
+                            request_cancel(target, skip=True)
+                        else:
+                            skip_waiting(target)
+                        continue
+                    if stop:
+                        continue
+                    if cmd in ("j", "job"):
+                        change_idle_job()
+                        continue
+                    if key in cat.jobs or (key.isdigit() and int(key) >= 1):
+                        waiting_lanes = [ln for ln in lanes if ln.wait_load]
+                        if len(waiting_lanes) == 1:
+                            try:
+                                job = _resolve_job(
+                                    load(cat.path, cat.state_path), key, waiting_lanes[0].job.id if waiting_lanes[0].job else None
+                                )
+                            except ValueError:
+                                board.set_note(HELP)
+                                continue
+                            if job:
+                                waiting_lanes[0].job = job
+                                _set_current(cat, job)
+                                _arm_lane(load(cat.path, cat.state_path), board, lanes, waiting_lanes[0])
+                        continue
+                    start_ready(True)
+            except BaseException:
+                abort_inflight()
+                raise
     except BaseException:
+        abort_inflight()
         lock = locked(cat.state_path)
         try:
             fresh = load(cat.path, cat.state_path)
             for ln in lanes:
                 if ln.busy and ln.job and ln.disc is not None:
-                    if ln.disc in fresh.state_for(ln.job.id).pending:
+                    st = fresh.state_for(ln.job.id)
+                    if ln.skip:
+                        mark_skipped(fresh, fresh.jobs[ln.job.id], ln.disc)
+                    elif ln.disc in st.pending:
                         mark_failed(fresh, fresh.jobs[ln.job.id], ln.disc)
         finally:
             lock.close()

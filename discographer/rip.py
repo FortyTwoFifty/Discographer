@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import hashlib
+import os
+import select
 import shutil
+import signal
 import subprocess
 import threading
+import time
 import wave
 import zlib
 from collections.abc import Callable
@@ -17,10 +21,53 @@ from discographer.cd import Toc, cddb_id, msf_stamp, query_toc, read_cdtext, wri
 BYTES_PER_SECTOR = 2352
 
 
+class RipCancelled(RuntimeError):
+    pass
+
+
+def signal_rip(proc: subprocess.Popen, sig: int = signal.SIGTERM) -> None:
+    if proc.poll() is not None:
+        return
+    try:
+        os.killpg(proc.pid, sig)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.send_signal(sig)
+        except OSError:
+            pass
+
+
+def terminate_rip(proc: subprocess.Popen) -> None:
+    signal_rip(proc, signal.SIGTERM)
+    try:
+        proc.wait(timeout=3)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    signal_rip(proc, signal.SIGKILL)
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def throw_if_cancelled(cancel: threading.Event | None) -> None:
+    if cancel is not None and cancel.is_set():
+        raise RipCancelled("cancelled")
+
+
 def work_dir(cat: Catalog, job: Job, disc: int, drive: Drive) -> Path:
     d = cat.staging / job.id / f"disc-{disc}-{drive.id}"
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+def remove_work_dir(wd: Path) -> None:
+    shutil.rmtree(wd)
+    try:
+        wd.parent.rmdir()
+    except OSError:
+        pass
 
 
 def rip_wav(
@@ -28,6 +75,8 @@ def rip_wav(
     wav: Path,
     summary: Path,
     on_line: Callable[[str], None] | None = None,
+    cancel: threading.Event | None = None,
+    on_proc: Callable[[subprocess.Popen], None] | None = None,
 ) -> None:
     wav.unlink(missing_ok=True)
     progress = summary.with_name("progress.log")
@@ -51,23 +100,48 @@ def rip_wav(
         stderr=subprocess.PIPE,
         text=True,
         bufsize=1,
+        start_new_session=True,
     )
+    if on_proc:
+        on_proc(proc)
     assert proc.stderr is not None
     tail: list[str] = []
-    with progress.open("w") as log:
-        for line in proc.stderr:
-            log.write(line)
-            tail.append(line)
-            if len(tail) > 40:
-                tail = tail[-20:]
-            if on_line:
-                on_line(line)
+    fd = proc.stderr
     try:
-        rc = proc.wait(timeout=3600)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait()
-        raise RuntimeError(f"cdparanoia timed out on {drive.path}")
+        throw_if_cancelled(cancel)
+        with progress.open("w") as log:
+            while True:
+                throw_if_cancelled(cancel)
+                ready, _, _ = select.select([fd], [], [], 0.25)
+                if not ready:
+                    if proc.poll() is not None:
+                        leftover = fd.read()
+                        if leftover:
+                            log.write(leftover)
+                            for line in leftover.splitlines(keepends=True):
+                                tail.append(line)
+                                if on_line:
+                                    on_line(line)
+                        break
+                    continue
+                line = fd.readline()
+                if line == "":
+                    break
+                log.write(line)
+                tail.append(line)
+                if len(tail) > 40:
+                    tail = tail[-20:]
+                if on_line:
+                    on_line(line)
+        try:
+            rc = proc.wait(timeout=3600)
+        except subprocess.TimeoutExpired:
+            terminate_rip(proc)
+            raise RuntimeError(f"cdparanoia timed out on {drive.path}")
+    except RipCancelled:
+        terminate_rip(proc)
+        raise
+    throw_if_cancelled(cancel)
     if rc != 0 or not wav.is_file() or wav.stat().st_size < 1024:
         raise RuntimeError(
             f"cdparanoia failed on {drive.path} (exit {rc})\n{''.join(tail[-20:])}"
@@ -96,6 +170,8 @@ def encode_flac(
     job: Job,
     disc: int,
     on_progress: Callable[[str, float | None], None] | None = None,
+    cancel: threading.Event | None = None,
+    on_proc: Callable[[subprocess.Popen], None] | None = None,
 ) -> None:
     flac.unlink(missing_ok=True)
     tags = [
@@ -117,21 +193,45 @@ def encode_flac(
     for t in tags:
         cmd.extend(["-T", t])
     cmd.append(str(wav))
-    stop = threading.Event()
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    if on_proc:
+        on_proc(proc)
+    err_box = [""]
 
-    def beat():
-        while not stop.wait(0.4):
-            if on_progress:
-                on_progress("encoding", None)
+    def drain():
+        if proc.stderr is not None:
+            err_box[0] = proc.stderr.read()
 
-    th = threading.Thread(target=beat, daemon=True)
+    th = threading.Thread(target=drain, daemon=True)
     th.start()
+    deadline = time.monotonic() + 1800
     try:
-        r = subprocess.run(cmd, timeout=1800, capture_output=True, text=True)
-    finally:
-        stop.set()
-    if r.returncode != 0 or not flac.is_file():
-        raise RuntimeError(r.stderr.strip() or "flac encode failed")
+        while True:
+            throw_if_cancelled(cancel)
+            try:
+                rc = proc.wait(timeout=0.4)
+                break
+            except subprocess.TimeoutExpired:
+                if time.monotonic() > deadline:
+                    terminate_rip(proc)
+                    raise RuntimeError("flac encode timed out")
+                if on_progress:
+                    on_progress("encoding", None)
+        th.join(timeout=2)
+        err = err_box[0]
+    except RipCancelled:
+        terminate_rip(proc)
+        raise
+    throw_if_cancelled(cancel)
+    if rc != 0 or not flac.is_file():
+        raise RuntimeError((err or "").strip() or "flac encode failed")
+    throw_if_cancelled(cancel)
     t = subprocess.run(["flac", "-t", str(flac)], capture_output=True, text=True, timeout=300)
     if t.returncode != 0:
         raise RuntimeError(t.stderr.strip() or "flac test failed")
@@ -211,12 +311,14 @@ def copy_verified(
     src: Path,
     dest: Path,
     on_progress: Callable[[str, float | None], None] | None = None,
+    cancel: threading.Event | None = None,
 ) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     total = src.stat().st_size
     copied = 0
     with src.open("rb") as inf, dest.open("wb") as out:
         while True:
+            throw_if_cancelled(cancel)
             chunk = inf.read(1024 * 1024)
             if not chunk:
                 break
@@ -284,6 +386,8 @@ def rip_disc(
     on_progress: Callable[[str, float | None], None] | None = None,
     on_line: Callable[[str], None] | None = None,
     on_leadout: Callable[[int], None] | None = None,
+    cancel: threading.Event | None = None,
+    on_proc: Callable[[subprocess.Popen], None] | None = None,
 ) -> Path:
     if disc < 1 or disc > job.discs:
         raise RuntimeError(f"disc {disc} out of range 1..{job.discs}")
@@ -308,6 +412,7 @@ def rip_disc(
         titles = read_cdtext(drive)
     except (subprocess.TimeoutExpired, OSError):
         titles = {}
+    throw_if_cancelled(cancel)
     wd = work_dir(cat, job, disc, drive)
     wav = wd / "image.wav"
     summary = wd / "paranoia.log"
@@ -318,41 +423,52 @@ def rip_disc(
         on_progress("ripping", 0.0)
     else:
         print(f"[{drive.id}] ripping disc {disc}/{job.discs}  {job.album_name()}", flush=True)
-    rip_wav(drive, wav, summary, on_line=on_line)
-    if on_progress:
-        on_progress("hashing", None)
-    else:
-        print(f"[{drive.id}] encoding flac", flush=True)
-    write_cue(cue_tmp, job, disc, toc, titles, job.flac_name(disc))
-    image_crc, track_crcs = track_crc32(wav, toc)
-    encode_flac(wav, flac_tmp, job, disc, on_progress=on_progress)
-    if on_progress:
-        on_progress("copying", 0.0)
-    else:
-        print(f"[{drive.id}] copying to {dest_dir}", flush=True)
-    write_log(
-        log_tmp,
-        job,
-        disc,
-        drive,
-        toc,
-        wav,
-        dest_flac,
-        summary,
-        image_crc,
-        track_crcs,
-    )
     try:
-        copy_verified(flac_tmp, dest_flac, on_progress=on_progress)
-        copy_verified(cue_tmp, dest_cue)
-        copy_verified(log_tmp, dest_log)
-    except Exception:
-        dest_flac.unlink(missing_ok=True)
-        dest_cue.unlink(missing_ok=True)
-        dest_log.unlink(missing_ok=True)
+        rip_wav(drive, wav, summary, on_line=on_line, cancel=cancel, on_proc=on_proc)
+        throw_if_cancelled(cancel)
+        if on_progress:
+            on_progress("hashing", None)
+        else:
+            print(f"[{drive.id}] encoding flac", flush=True)
+        write_cue(cue_tmp, job, disc, toc, titles, job.flac_name(disc))
+        image_crc, track_crcs = track_crc32(wav, toc)
+        throw_if_cancelled(cancel)
+        encode_flac(
+            wav, flac_tmp, job, disc, on_progress=on_progress, cancel=cancel, on_proc=on_proc
+        )
+        if on_progress:
+            on_progress("copying", 0.0)
+        else:
+            print(f"[{drive.id}] copying to {dest_dir}", flush=True)
+        write_log(
+            log_tmp,
+            job,
+            disc,
+            drive,
+            toc,
+            wav,
+            dest_flac,
+            summary,
+            image_crc,
+            track_crcs,
+        )
+        try:
+            copy_verified(flac_tmp, dest_flac, on_progress=on_progress, cancel=cancel)
+            copy_verified(cue_tmp, dest_cue, cancel=cancel)
+            copy_verified(log_tmp, dest_log, cancel=cancel)
+        except Exception:
+            dest_flac.unlink(missing_ok=True)
+            dest_cue.unlink(missing_ok=True)
+            dest_log.unlink(missing_ok=True)
+            raise
+    except RipCancelled:
+        if not keep:
+            remove_work_dir(wd)
+        if not no_eject:
+            eject(drive)
         raise
     if not keep:
-        shutil.rmtree(wd)
+        remove_work_dir(wd)
     if not no_eject:
         eject(drive)
     if on_progress:

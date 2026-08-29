@@ -127,6 +127,7 @@ class JobState:
     next_disc: int = 1
     ripped: list[int] = field(default_factory=list)
     pending: list[int] = field(default_factory=list)
+    skipped: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -158,7 +159,7 @@ class Catalog:
 
     def remaining(self, job: Job) -> list[int]:
         st = self.state_for(job.id)
-        taken = set(st.ripped) | set(st.pending)
+        taken = set(st.ripped) | set(st.pending) | set(st.skipped)
         return [n for n in range(1, job.discs + 1) if n not in taken]
 
 
@@ -226,11 +227,13 @@ def load(catalog_path: Path | None = None, state_path: Path | None = None) -> Ca
     for jid, s in (st.get("jobs") or {}).items():
         ripped = [int(n) for n in (s.get("ripped") or [])]
         pending = [int(n) for n in (s.get("pending") or [])]
+        skipped = [int(n) for n in (s.get("skipped") or [])]
         nxt = int(s.get("next_disc") or 1)
         job_state[jid] = JobState(
             next_disc=nxt,
             ripped=sorted(set(ripped)),
             pending=sorted(set(pending)),
+            skipped=sorted(set(skipped)),
         )
     library = Path(os.path.expanduser(str(raw.get("library") or "~/Music")))
     staging = Path(os.path.expanduser(str(raw.get("staging") or "~/.cache/discographer")))
@@ -267,6 +270,7 @@ def save_state(cat: Catalog) -> None:
                 "next_disc": st.next_disc,
                 "ripped": sorted(set(st.ripped)),
                 "pending": sorted(set(st.pending)),
+                "skipped": sorted(set(st.skipped)),
             }
             for jid, st in cat.job_state.items()
         },
@@ -285,28 +289,55 @@ def locked(state_path: Path):
     return fh
 
 
+def _refresh_next(st: JobState, job: Job) -> None:
+    taken = set(st.ripped) | set(st.pending) | set(st.skipped)
+    remain = [n for n in range(1, job.discs + 1) if n not in taken]
+    st.next_disc = remain[0] if remain else job.discs + 1
+
+
 def mark_pending(cat: Catalog, job: Job, discs: list[int]) -> None:
     st = cat.state_for(job.id)
     st.pending = sorted(set(st.pending) | set(discs))
+    _refresh_next(st, job)
     save_state(cat)
 
 
 def mark_ripped(cat: Catalog, job: Job, disc: int) -> None:
     st = cat.state_for(job.id)
     st.pending = [n for n in st.pending if n != disc]
+    st.skipped = [n for n in st.skipped if n != disc]
     if disc not in st.ripped:
         st.ripped.append(disc)
         st.ripped = sorted(set(st.ripped))
-    remain = [n for n in range(1, job.discs + 1) if n not in set(st.ripped) | set(st.pending)]
-    st.next_disc = remain[0] if remain else job.discs + 1
+    _refresh_next(st, job)
     save_state(cat)
 
 
 def mark_failed(cat: Catalog, job: Job, disc: int) -> None:
     st = cat.state_for(job.id)
     st.pending = [n for n in st.pending if n != disc]
-    remain = [n for n in range(1, job.discs + 1) if n not in set(st.ripped) | set(st.pending)]
-    st.next_disc = remain[0] if remain else job.discs + 1
+    _refresh_next(st, job)
+    save_state(cat)
+
+
+def mark_skipped(cat: Catalog, job: Job, disc: int) -> None:
+    st = cat.state_for(job.id)
+    if disc < 1 or disc > job.discs:
+        raise RuntimeError(f"disc {disc} out of range 1..{job.discs}")
+    if disc in st.ripped:
+        raise RuntimeError(f"disc {disc} is already ripped")
+    st.pending = [n for n in st.pending if n != disc]
+    if disc not in st.skipped:
+        st.skipped.append(disc)
+        st.skipped = sorted(set(st.skipped))
+    _refresh_next(st, job)
+    save_state(cat)
+
+
+def mark_unskipped(cat: Catalog, job: Job, disc: int) -> None:
+    st = cat.state_for(job.id)
+    st.skipped = [n for n in st.skipped if n != disc]
+    _refresh_next(st, job)
     save_state(cat)
 
 
@@ -329,6 +360,6 @@ def scan_job(cat: Catalog, job: Job) -> JobState:
                 found.append(n)
     st.ripped = sorted(set(found))
     st.pending = []
-    remain = [n for n in range(1, job.discs + 1) if n not in st.ripped]
-    st.next_disc = remain[0] if remain else job.discs + 1
+    st.skipped = [n for n in st.skipped if n not in st.ripped]
+    _refresh_next(st, job)
     return st

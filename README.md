@@ -52,7 +52,9 @@ While a drive rips you see a progress bar, CD-relative speed (`8.2x`), and ETA. 
 |---|---|
 | Enter | start idle lanes that have a disc loaded |
 | `j` | change job on an idle lane |
-| `q` | finish in-flight rips, then quit |
+| `x` / `x sr0` | cancel the in-flight rip on that drive; other lanes keep going |
+| `s` / `s sr0` | skip this disc (unreadable); record the gap and arm the next one |
+| `q` | finish in-flight rips, then quit (`x`/`s` still work while quitting) |
 
 One-shot, no session:
 
@@ -64,7 +66,7 @@ discographer devices
 
 ## Catalog
 
-`catalog.yaml` is what you edit. `state.yaml` (next to it) is written by the tool: `ripped`, `next_disc`, `pending`.
+`catalog.yaml` is what you edit. `state.yaml` (next to it) is written by the tool: `ripped`, `next_disc`, `pending`, `skipped`.
 
 ```yaml
 library: ~/Music
@@ -139,16 +141,34 @@ Change it when you add a drive whose table value is not 6, or when two drives ri
 | `status` | current job, drives, next disc |
 | `jobs` | all catalog jobs |
 | `set JOB` | default job id |
-| `scan [JOB]` | set `ripped` / `next_disc` from library folders |
+| `scan [JOB]` | set `ripped` / `next_disc` from library folders (keeps `skipped`) |
 | `devices` | drives + TOC/CD-Text if a disc is loaded |
 | `toc [-d sr0]` | TOC and CD-Text |
 | `rip [-d sr0] [--disc N]` | one disc, no session |
+| `skip N [JOB]` | mark disc N unreadable and continue the job without it |
+| `unskip N [JOB]` | put a skipped disc back on the remaining list |
 | `salvage [JOB]` | copy finished staging files into the library |
 | `retag [JOB]` | rewrite tags/CUE from the catalog, no re-rip |
 | `retag --rename-from "Old Album"` | move files, then retag |
 | `eject [sr0\|all]` | eject |
 
 `--dry-run`, `--force`, `--keep` (leave staging WAV/FLAC), `--no-eject` apply to `rip` and `session`.
+
+## Damaged discs
+
+discographer does not give up on a slow disc by itself. `cdparanoia -z20` retries each unreadable sector up to 20 times, then skips that sector and continues. A scratched GraphicAudio disc can sit on one sector for a long time; the lane will keep trying until the read finishes, the process fails, or you cancel it. There is no overall time limit on a rip. The other drives are independent and are not blocked.
+
+A rip that *does* finish after retries is still marked ripped. The `.log` will say to check the cdparanoia summary if it contains reconstruction or skips — that disc may have silent or interpolated samples.
+
+When a disc will not come back:
+
+- **`x`** (or `x sr0`) kills cdparanoia on that drive only, ejects, and offers the **same** disc again. Use this to stop a hopeless attempt without recording a gap — retry later, try the other drive, or skip next.
+- **`s`** (or `s sr0`) is the collection-level decision: abort if it is ripping, mark that disc **skipped** in `state.yaml`, and arm the next remaining disc. The job can complete with a hole. `status` / `jobs` show `skipped: [2]`.
+- **`discographer skip 2`** / **`unskip 2`** do the same outside a session (current job, or pass the job id).
+
+Skipped discs are not offered in a session and do not block the rest of a set. `scan` keeps them (it only drops a skip if that disc’s FLAC later appears in the library). To retry a replacement disc: `unskip N` then session, or `discographer rip --disc N`. A successful rip clears the skip. A failed retry of a still-skipped disc stays skipped.
+
+`q` still waits for in-flight rips. If one lane is stuck, `x` or `s` that drive, then `q`.
 
 ## Accuracy
 

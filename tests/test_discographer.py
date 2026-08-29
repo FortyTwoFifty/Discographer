@@ -224,6 +224,15 @@ class TestProgress(unittest.TestCase):
         eta = eta_from_speed(CD_1X_WORDS * 40, 0.5, 8.0)
         self.assertAlmostEqual(eta, 5.0, places=2)
 
+    def test_cmd_drive(self):
+        from discographer.tui import _cmd_drive
+
+        self.assertEqual(_cmd_drive(""), ("", None))
+        self.assertEqual(_cmd_drive("x"), ("x", None))
+        self.assertEqual(_cmd_drive("x sr0"), ("x", "sr0"))
+        self.assertEqual(_cmd_drive("s sr1"), ("s", "sr1"))
+        self.assertEqual(_cmd_drive("SKIP sr0"), ("skip", "sr0"))
+
     def test_next_free_disc(self):
         from discographer.tui import next_free_disc
 
@@ -273,6 +282,7 @@ jobs:
             rc = cmd_salvage(cat, Namespace(job="test-job"))
             self.assertEqual(rc, 0)
             self.assertFalse(d.exists())
+            self.assertFalse((cat.staging / job.id).exists())
             dest = job.disc_dir(cat.library, 1)
             self.assertTrue((dest / job.flac_name(1)).is_file())
             self.assertTrue((dest / job.cue_name(1)).is_file())
@@ -294,6 +304,242 @@ jobs:
             rc = cmd_salvage(cat, Namespace(job="test-job"))
             self.assertEqual(rc, 1)
             self.assertTrue(d.exists())
+            self.assertTrue((cat.staging / job.id).is_dir())
+
+
+class TestRemoveWorkDir(unittest.TestCase):
+    def test_removes_empty_job_dir(self):
+        from discographer.rip import remove_work_dir
+
+        with tempfile.TemporaryDirectory() as td:
+            wd = Path(td) / "test-job" / "disc-1-sr0"
+            wd.mkdir(parents=True)
+            (wd / "image.wav").write_bytes(b"x")
+            remove_work_dir(wd)
+            self.assertFalse(wd.exists())
+            self.assertFalse((Path(td) / "test-job").exists())
+            self.assertTrue(Path(td).is_dir())
+
+    def test_keeps_job_dir_when_sibling_remains(self):
+        from discographer.rip import remove_work_dir
+
+        with tempfile.TemporaryDirectory() as td:
+            job = Path(td) / "test-job"
+            wd = job / "disc-1-sr0"
+            sibling = job / "disc-2-sr1"
+            wd.mkdir(parents=True)
+            sibling.mkdir(parents=True)
+            (wd / "image.wav").write_bytes(b"x")
+            remove_work_dir(wd)
+            self.assertFalse(wd.exists())
+            self.assertTrue(sibling.is_dir())
+            self.assertTrue(job.is_dir())
+
+
+class TestSkipState(unittest.TestCase):
+    def _cat(self, td: Path, discs: int = 7):
+        from discographer.catalog import save_state
+
+        cat_path = td / "catalog.yaml"
+        state_path = td / "state.yaml"
+        cat_path.write_text(
+            f"""
+library: {td / "library"}
+staging: {td / "staging"}
+drives:
+  sr0:
+    path: /dev/sr0
+jobs:
+  ga-book:
+    album: Test Set
+    author: Test Author
+    discs: {discs}
+"""
+        )
+        state_path.write_text("current: ga-book\n")
+        cat = load(cat_path, state_path)
+        save_state(cat)
+        return cat
+
+    def test_remaining_excludes_skipped_and_pending(self):
+        from discographer.catalog import mark_pending, mark_ripped, mark_skipped
+
+        with tempfile.TemporaryDirectory() as td:
+            cat = self._cat(Path(td))
+            job = cat.job("ga-book")
+            mark_ripped(cat, job, 1)
+            mark_pending(cat, job, [2])
+            mark_skipped(cat, job, 3)
+            self.assertEqual(cat.remaining(job), [4, 5, 6, 7])
+            st = cat.state_for(job.id)
+            self.assertEqual(st.ripped, [1])
+            self.assertEqual(st.pending, [2])
+            self.assertEqual(st.skipped, [3])
+            self.assertEqual(st.next_disc, 4)
+
+    def test_skip_unpends_and_completes_job(self):
+        from discographer.catalog import mark_pending, mark_ripped, mark_skipped
+
+        with tempfile.TemporaryDirectory() as td:
+            cat = self._cat(Path(td), discs=3)
+            job = cat.job("ga-book")
+            mark_ripped(cat, job, 1)
+            mark_ripped(cat, job, 3)
+            mark_pending(cat, job, [2])
+            mark_skipped(cat, job, 2)
+            st = cat.state_for(job.id)
+            self.assertEqual(st.pending, [])
+            self.assertEqual(st.skipped, [2])
+            self.assertEqual(st.ripped, [1, 3])
+            self.assertEqual(cat.remaining(job), [])
+            self.assertEqual(st.next_disc, 4)
+
+    def test_failed_retry_of_skipped_stays_skipped(self):
+        from discographer.catalog import mark_failed, mark_pending, mark_skipped
+
+        with tempfile.TemporaryDirectory() as td:
+            cat = self._cat(Path(td), discs=3)
+            job = cat.job("ga-book")
+            mark_skipped(cat, job, 2)
+            mark_pending(cat, job, [2])
+            mark_failed(cat, job, 2)
+            st = cat.state_for(job.id)
+            self.assertEqual(st.pending, [])
+            self.assertEqual(st.skipped, [2])
+            self.assertEqual(cat.remaining(job), [1, 3])
+
+    def test_successful_rip_clears_skipped(self):
+        from discographer.catalog import mark_ripped, mark_skipped
+
+        with tempfile.TemporaryDirectory() as td:
+            cat = self._cat(Path(td), discs=3)
+            job = cat.job("ga-book")
+            mark_skipped(cat, job, 2)
+            mark_ripped(cat, job, 2)
+            st = cat.state_for(job.id)
+            self.assertEqual(st.skipped, [])
+            self.assertEqual(st.ripped, [2])
+            self.assertEqual(cat.remaining(job), [1, 3])
+
+    def test_skip_of_ripped_raises(self):
+        from discographer.catalog import mark_ripped, mark_skipped
+
+        with tempfile.TemporaryDirectory() as td:
+            cat = self._cat(Path(td), discs=3)
+            job = cat.job("ga-book")
+            mark_ripped(cat, job, 2)
+            with self.assertRaises(RuntimeError):
+                mark_skipped(cat, job, 2)
+
+    def test_scan_preserves_skipped_without_flac(self):
+        from discographer.catalog import mark_skipped, save_state, scan_job
+
+        with tempfile.TemporaryDirectory() as td:
+            cat = self._cat(Path(td), discs=3)
+            job = cat.job("ga-book")
+            d1 = job.disc_dir(cat.library, 1)
+            d1.mkdir(parents=True)
+            (d1 / job.flac_name(1)).write_bytes(b"flac")
+            mark_skipped(cat, job, 2)
+            st = scan_job(cat, job)
+            save_state(cat)
+            self.assertEqual(st.ripped, [1])
+            self.assertEqual(st.skipped, [2])
+            self.assertEqual(st.pending, [])
+            self.assertEqual(cat.remaining(job), [3])
+            self.assertEqual(st.next_disc, 3)
+
+    def test_scan_clears_skipped_when_flac_appears(self):
+        from discographer.catalog import mark_skipped, scan_job
+
+        with tempfile.TemporaryDirectory() as td:
+            cat = self._cat(Path(td), discs=3)
+            job = cat.job("ga-book")
+            mark_skipped(cat, job, 2)
+            d2 = job.disc_dir(cat.library, 2)
+            d2.mkdir(parents=True)
+            (d2 / job.flac_name(2)).write_bytes(b"flac")
+            st = scan_job(cat, job)
+            self.assertEqual(st.ripped, [2])
+            self.assertEqual(st.skipped, [])
+            self.assertEqual(cat.remaining(job), [1, 3])
+
+    def test_unskip_returns_to_remaining(self):
+        from discographer.catalog import mark_skipped, mark_unskipped
+
+        with tempfile.TemporaryDirectory() as td:
+            cat = self._cat(Path(td), discs=3)
+            job = cat.job("ga-book")
+            mark_skipped(cat, job, 2)
+            mark_unskipped(cat, job, 2)
+            self.assertEqual(cat.state_for(job.id).skipped, [])
+            self.assertEqual(cat.remaining(job), [1, 2, 3])
+
+    def test_load_roundtrip_skipped(self):
+        from discographer.catalog import mark_skipped
+
+        with tempfile.TemporaryDirectory() as td:
+            cat = self._cat(Path(td), discs=3)
+            job = cat.job("ga-book")
+            mark_skipped(cat, job, 2)
+            cat2 = load(cat.path, cat.state_path)
+            self.assertEqual(cat2.state_for("ga-book").skipped, [2])
+            self.assertEqual(cat2.remaining(cat2.job("ga-book")), [1, 3])
+
+    def test_cli_skip_unskip(self):
+        from argparse import Namespace
+
+        from discographer.cli import cmd_skip, cmd_unskip
+
+        with tempfile.TemporaryDirectory() as td:
+            cat = self._cat(Path(td), discs=3)
+            rc = cmd_skip(cat, Namespace(job="ga-book", disc=2))
+            self.assertEqual(rc, 0)
+            cat = load(cat.path, cat.state_path)
+            self.assertEqual(cat.state_for("ga-book").skipped, [2])
+            rc = cmd_unskip(cat, Namespace(job="ga-book", disc=2))
+            self.assertEqual(rc, 0)
+            cat = load(cat.path, cat.state_path)
+            self.assertEqual(cat.state_for("ga-book").skipped, [])
+
+    def test_next_free_disc_skips_skipped(self):
+        from discographer.catalog import mark_skipped
+        from discographer.tui import next_free_disc
+
+        with tempfile.TemporaryDirectory() as td:
+            cat = self._cat(Path(td), discs=3)
+            job = cat.job("ga-book")
+            mark_skipped(cat, job, 1)
+            self.assertEqual(next_free_disc(cat, job, set()), 2)
+            self.assertEqual(next_free_disc(cat, job, {(job.id, 2)}), 3)
+
+
+class TestTerminateRip(unittest.TestCase):
+    def test_kills_process_group(self):
+        import subprocess
+
+        from discographer.rip import terminate_rip
+
+        proc = subprocess.Popen(["sleep", "30"], start_new_session=True)
+        try:
+            terminate_rip(proc)
+            self.assertIsNotNone(proc.poll())
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+
+    def test_throw_if_cancelled(self):
+        import threading
+
+        from discographer.rip import RipCancelled, throw_if_cancelled
+
+        throw_if_cancelled(None)
+        throw_if_cancelled(threading.Event())
+        ev = threading.Event()
+        ev.set()
+        with self.assertRaises(RipCancelled):
+            throw_if_cancelled(ev)
 
 
 if __name__ == "__main__":
