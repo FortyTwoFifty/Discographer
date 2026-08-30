@@ -353,6 +353,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--catalog", type=Path, default=None)
     p.add_argument("--state", type=Path, default=None)
+    p.add_argument(
+        "--auto",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="session: start each loaded disc without waiting for Enter",
+    )
     p.set_defaults(
         func=run_session,
         keep=False,
@@ -362,6 +368,7 @@ def build_parser() -> argparse.ArgumentParser:
         disc=None,
         job=None,
         drive=None,
+        auto=None,
     )
     sub = p.add_subparsers(dest="cmd", required=False)
 
@@ -407,8 +414,21 @@ def build_parser() -> argparse.ArgumentParser:
         parents=[rip_opts],
         help="interactive session: one lane per drive, independent rips",
     )
+    sp.add_argument(
+        "--auto",
+        action=argparse.BooleanOptionalAction,
+        default=argparse.SUPPRESS,
+        help="start each loaded disc without waiting for Enter",
+    )
     sp.set_defaults(func=run_session)
-    sub.add_parser("both", parents=[rip_opts], help="alias for session").set_defaults(func=run_session)
+    both = sub.add_parser("both", parents=[rip_opts], help="alias for session")
+    both.add_argument(
+        "--auto",
+        action=argparse.BooleanOptionalAction,
+        default=argparse.SUPPRESS,
+        help="start each loaded disc without waiting for Enter",
+    )
+    both.set_defaults(func=run_session)
 
     sp = sub.add_parser(
         "skip",

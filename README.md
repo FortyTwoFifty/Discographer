@@ -44,13 +44,16 @@ discographer scan          # sync ripped discs from the library folders
 discographer               # interactive session (also: discographer session)
 ```
 
-At start, each detected `/dev/sr*` (or each drive listed in the catalog) is a lane. You assign a **job** per drive — they can be the same album or two different ones. The TUI tells you which disc to put in which tray and **waits for Enter** before that drive starts.
+At start, each detected `/dev/sr*` (or each drive listed in the catalog) is a lane. You assign a **job** per drive — they can be the same album or two different ones. For each job you can turn on **auto-start** (default yes for multi-disc jobs): after a disc ejects, inserting the next one starts that lane without pressing Enter. `--auto` / `--no-auto` skip the question.
+
+The TUI tells you which disc to put in which tray. Manual lanes **wait for Enter**; auto lanes start as soon as a disc is loaded (they will not immediately retry a failed or cancelled disc still in the tray — Enter retries, or eject and insert).
 
 While a drive rips you see a progress bar, CD-relative speed (`8.2x`), and ETA. When it finishes it ejects and immediately arms **that drive’s** next disc. The other lanes keep going.
 
 | Key | Action |
 |---|---|
 | Enter | start idle lanes that have a disc loaded |
+| `a` / `a sr0` | toggle auto-start on an idle lane |
 | `j` | change job on an idle lane |
 | `x` / `x sr0` | cancel the in-flight rip on that drive; other lanes keep going |
 | `s` / `s sr0` | skip this disc (unreadable); record the gap and arm the next one |
@@ -152,7 +155,7 @@ Change it when you add a drive whose table value is not 6, or when two drives ri
 | `retag --rename-from "Old Album"` | move files, then retag |
 | `eject [sr0\|all]` | eject |
 
-`--dry-run`, `--force`, `--keep` (leave staging WAV/FLAC), `--no-eject` apply to `rip` and `session`.
+`--dry-run`, `--force`, `--keep` (leave staging WAV/FLAC), `--no-eject` apply to `rip` and `session`. `--auto` / `--no-auto` apply to `session`.
 
 ## Damaged discs
 

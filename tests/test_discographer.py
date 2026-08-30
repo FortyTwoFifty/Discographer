@@ -232,6 +232,9 @@ class TestProgress(unittest.TestCase):
         self.assertEqual(_cmd_drive("x sr0"), ("x", "sr0"))
         self.assertEqual(_cmd_drive("s sr1"), ("s", "sr1"))
         self.assertEqual(_cmd_drive("SKIP sr0"), ("skip", "sr0"))
+        self.assertEqual(_cmd_drive("a"), ("a", None))
+        self.assertEqual(_cmd_drive("a sr1"), ("a", "sr1"))
+        self.assertEqual(_cmd_drive("auto sr0"), ("auto", "sr0"))
 
     def test_next_free_disc(self):
         from discographer.tui import next_free_disc
@@ -540,6 +543,91 @@ class TestTerminateRip(unittest.TestCase):
         ev.set()
         with self.assertRaises(RipCancelled):
             throw_if_cancelled(ev)
+
+
+class TestAutoMode(unittest.TestCase):
+    def test_arm_and_poll_helpers(self):
+        from discographer.tui import arm_auto_ok, note_empty, should_autostart
+
+        self.assertTrue(arm_auto_ok(False, allow_loaded=False))
+        self.assertFalse(arm_auto_ok(True, allow_loaded=False))
+        self.assertTrue(arm_auto_ok(True, allow_loaded=True))
+        self.assertTrue(note_empty(False, False))
+        self.assertFalse(note_empty(True, False))
+        self.assertTrue(note_empty(True, True))
+        self.assertTrue(should_autostart(True, True, True))
+        self.assertFalse(should_autostart(True, True, False))
+        self.assertFalse(should_autostart(True, False, True))
+        self.assertFalse(should_autostart(False, True, True))
+
+    def test_ask_yes_no(self):
+        from unittest.mock import patch
+
+        from discographer.tui import _ask_yes_no
+
+        with patch("builtins.input", return_value=""):
+            self.assertTrue(_ask_yes_no("p", True))
+            self.assertFalse(_ask_yes_no("p", False))
+        with patch("builtins.input", return_value="y"):
+            self.assertTrue(_ask_yes_no("p", False))
+        with patch("builtins.input", return_value="No"):
+            self.assertFalse(_ask_yes_no("p", True))
+        with patch("builtins.input", side_effect=EOFError):
+            self.assertTrue(_ask_yes_no("p", True))
+
+    def test_resolve_auto_flag_and_default(self):
+        from argparse import Namespace
+        from unittest.mock import patch
+
+        from discographer.tui import _resolve_auto
+
+        multi = wok_job()
+        single = Job(id="dsm", album="The Dark Side of the Moon", author="Pink Floyd", discs=1)
+        self.assertTrue(_resolve_auto(Namespace(auto=True), single))
+        self.assertFalse(_resolve_auto(Namespace(auto=False), multi))
+        with patch("discographer.tui._ask_yes_no", return_value=True) as ask:
+            self.assertTrue(_resolve_auto(Namespace(auto=None), multi))
+            ask.assert_called_once()
+            self.assertTrue(ask.call_args.kwargs["default"])
+        with patch("discographer.tui._ask_yes_no", return_value=False) as ask:
+            self.assertFalse(_resolve_auto(Namespace(auto=None), single))
+            self.assertFalse(ask.call_args.kwargs["default"])
+
+    def test_wait_load_line_auto_vs_manual(self):
+        from discographer.tui import Board, Row
+
+        board = Board([Row(drive_id="sr0", name="test")])
+        board.tty = False
+        board.set_lane(
+            "sr0",
+            album="Album",
+            disc=2,
+            discs=6,
+            phase="wait_load",
+            ready=False,
+            auto=True,
+            auto_ok=True,
+        )
+        text = "\n".join(board._lines())
+        self.assertIn("will start when loaded", text)
+        self.assertIn("[empty]", text)
+        board.set_ready("sr0", True, auto_ok=False)
+        text = "\n".join(board._lines())
+        self.assertIn("then Enter", text)
+        self.assertIn("[ready]", text)
+
+    def test_parser_auto_flags(self):
+        from discographer.cli import build_parser
+
+        p = build_parser()
+        self.assertIsNone(p.parse_args([]).auto)
+        self.assertTrue(p.parse_args(["--auto"]).auto)
+        self.assertFalse(p.parse_args(["--no-auto"]).auto)
+        self.assertTrue(p.parse_args(["session", "--auto"]).auto)
+        self.assertFalse(p.parse_args(["session", "--no-auto"]).auto)
+        self.assertTrue(p.parse_args(["--auto", "session"]).auto)
+        self.assertFalse(p.parse_args(["--no-auto", "session"]).auto)
+        self.assertIsNone(p.parse_args(["session"]).auto)
 
 
 if __name__ == "__main__":

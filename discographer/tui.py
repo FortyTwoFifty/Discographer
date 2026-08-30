@@ -120,6 +120,23 @@ def bar(frac: float | None, width: int = 28) -> str:
     return "█" * filled + "░" * (width - filled)
 
 
+HELP = "Enter=start   a=auto   j=job   x=cancel   s=skip   q=quit"
+
+
+def arm_auto_ok(media_present: bool, *, allow_loaded: bool) -> bool:
+    return (not media_present) or allow_loaded
+
+
+def note_empty(media_present: bool, auto_ok: bool) -> bool:
+    if not media_present:
+        return True
+    return auto_ok
+
+
+def should_autostart(auto: bool, media_present: bool, auto_ok: bool) -> bool:
+    return bool(auto and media_present and auto_ok)
+
+
 def _wait_line(timeout: float) -> str | None:
     if not sys.stdin.isatty():
         time.sleep(timeout)
@@ -146,12 +163,14 @@ class Row:
     last_pos: int | None = None
     last_t: float = 0.0
     ready: bool = False
+    auto: bool = False
+    auto_ok: bool = False
     samples: list[tuple[float, int]] = field(default_factory=list)
 
 
 class Board:
     def __init__(self, rows: list[Row]):
-        self.note = "Enter=start loaded idle drives   j=job   x=cancel   s=skip   q=quit"
+        self.note = HELP
         self.rows = {r.drive_id: r for r in rows}
         self.order = [r.drive_id for r in rows]
         self.lock = threading.Lock()
@@ -174,8 +193,12 @@ class Board:
                     flag = f"{GREEN}[ready]{RESET}"
                 else:
                     flag = f"{RED}[empty]{RESET}"
+                if r.auto and (not r.ready or r.auto_ok):
+                    how = "will start when loaded"
+                else:
+                    how = "then Enter"
                 lines.append(
-                    f"  put Disc {r.disc} of {r.discs}  then Enter  {flag}"
+                    f"  put Disc {r.disc} of {r.discs}  {how}  {flag}"
                 )
             elif r.phase == "idle":
                 lines.append("  idle")
@@ -287,6 +310,8 @@ class Board:
         phase: str,
         ready: bool = False,
         err: str | None = None,
+        auto: bool | None = None,
+        auto_ok: bool = False,
     ) -> None:
         with self.lock:
             r = self.rows[drive_id]
@@ -296,6 +321,9 @@ class Board:
             r.phase = phase
             r.ready = ready
             r.err = err
+            if auto is not None:
+                r.auto = auto
+            r.auto_ok = auto_ok
             r.frac = None
             r.eta = None
             r.speed_x = None
@@ -305,12 +333,25 @@ class Board:
             r.samples = []
             self._paint(force=True)
 
-    def set_ready(self, drive_id: str, ready: bool) -> None:
+    def set_ready(
+        self, drive_id: str, ready: bool, auto_ok: bool | None = None
+    ) -> None:
         with self.lock:
             r = self.rows[drive_id]
-            if r.ready == ready:
-                return
+            changed = r.ready != ready
             r.ready = ready
+            if auto_ok is not None and r.auto_ok != auto_ok:
+                r.auto_ok = auto_ok
+                changed = True
+            if changed:
+                self._paint(force=True)
+
+    def set_auto(self, drive_id: str, auto: bool) -> None:
+        with self.lock:
+            r = self.rows[drive_id]
+            if r.auto == auto:
+                return
+            r.auto = auto
             self._paint(force=True)
 
     def set_note(self, note: str) -> None:
@@ -427,6 +468,29 @@ def _ask_lane_job(cat: Catalog, drive: Drive, default_id: str | None) -> Job | N
         return _ask_lane_job(cat, drive, default_id)
 
 
+def _ask_yes_no(prompt: str, default: bool) -> bool:
+    hint = "Y/n" if default else "y/N"
+    while True:
+        try:
+            raw = input(f"{prompt} [{hint}]: ").strip().lower()
+        except EOFError:
+            return default
+        if raw == "":
+            return default
+        if raw in ("y", "yes"):
+            return True
+        if raw in ("n", "no"):
+            return False
+        print("y or n")
+
+
+def _resolve_auto(args, job: Job) -> bool:
+    specified = getattr(args, "auto", None)
+    if specified is not None:
+        return bool(specified)
+    return _ask_yes_no("  auto-start when a disc is loaded", default=job.discs > 1)
+
+
 @dataclass
 class Lane:
     drive: Drive
@@ -435,6 +499,8 @@ class Lane:
     busy: bool = False
     wait_load: bool = False
     skip: bool = False
+    auto: bool = False
+    auto_ok: bool = False
     proc: object | None = None
     cancel: threading.Event = field(default_factory=threading.Event)
 
@@ -486,12 +552,22 @@ def _pick_lane(
     return next((x for x in candidates if x.drive.id == raw), None)
 
 
-def _arm_lane(cat: Catalog, board: Board, lanes: list[Lane], ln: Lane) -> bool:
+def _arm_lane(
+    cat: Catalog,
+    board: Board,
+    lanes: list[Lane],
+    ln: Lane,
+    *,
+    allow_loaded: bool = False,
+) -> bool:
     cat = load(cat.path, cat.state_path)
     if ln.job is None:
-        board.set_lane(ln.drive.id, album="", disc=0, discs=0, phase="idle")
+        board.set_lane(
+            ln.drive.id, album="", disc=0, discs=0, phase="idle", auto=ln.auto
+        )
         ln.wait_load = False
         ln.disc = None
+        ln.auto_ok = False
         return False
     job = cat.jobs[ln.job.id]
     ln.job = job
@@ -499,23 +575,29 @@ def _arm_lane(cat: Catalog, board: Board, lanes: list[Lane], ln: Lane) -> bool:
     if n is None:
         ln.disc = None
         ln.wait_load = False
+        ln.auto_ok = False
         board.set_lane(
             ln.drive.id,
             album=job.album_name(),
             disc=0,
             discs=job.discs,
             phase="idle",
+            auto=ln.auto,
         )
         return False
     ln.disc = n
     ln.wait_load = True
+    media = has_media(ln.drive)
+    ln.auto_ok = arm_auto_ok(media, allow_loaded=allow_loaded)
     board.set_lane(
         ln.drive.id,
         album=job.album_name(),
         disc=n,
         discs=job.discs,
         phase="wait_load",
-        ready=has_media(ln.drive),
+        ready=media,
+        auto=ln.auto,
+        auto_ok=ln.auto_ok,
     )
     return True
 
@@ -532,7 +614,8 @@ def run_session(cat: Catalog, args) -> int:
             return 0
         default_id = job.id
         _set_current(cat, job)
-        lanes.append(Lane(drive=drive, job=job))
+        auto = False if args.dry_run else _resolve_auto(args, job)
+        lanes.append(Lane(drive=drive, job=job, auto=auto))
         cat = load(cat.path, cat.state_path)
     if args.dry_run:
         taken: set[tuple[str, int]] = set()
@@ -549,9 +632,10 @@ def run_session(cat: Catalog, args) -> int:
         return 0
 
     done_q: queue.Queue = queue.Queue()
-    rows = [Row(drive_id=ln.drive.id, name=ln.drive.name) for ln in lanes]
+    rows = [
+        Row(drive_id=ln.drive.id, name=ln.drive.name, auto=ln.auto) for ln in lanes
+    ]
     board = Board(rows)
-    HELP = "Enter=start loaded idle drives   j=job   x=cancel   s=skip   q=quit"
     board.note = HELP
     board.start()
     last_poll = 0.0
@@ -625,14 +709,17 @@ def run_session(cat: Catalog, args) -> int:
             ln.proc = None
         done_q.put((drive.id, job.id, disc, status, err))
 
-    def start_ready(force_check: bool) -> None:
+    def start_ready(force_check: bool, auto_only: bool = False) -> None:
         empty = []
         for ln in lanes:
             if not ln.wait_load or ln.busy or ln.job is None or ln.disc is None:
                 continue
+            if auto_only and (not ln.auto or not ln.auto_ok):
+                continue
             if not has_media(ln.drive):
                 empty.append(f"{ln.drive.id} (Disc {ln.disc})")
-                board.set_ready(ln.drive.id, False)
+                ln.auto_ok = True
+                board.set_ready(ln.drive.id, False, auto_ok=True)
                 continue
             lock = locked(cat.state_path)
             try:
@@ -652,6 +739,7 @@ def run_session(cat: Catalog, args) -> int:
                 disc=ln.disc,
                 discs=ln.job.discs,
                 phase="ripping",
+                auto=ln.auto,
             )
             ex.submit(work, ln)
         if force_check and empty:
@@ -675,15 +763,31 @@ def run_session(cat: Catalog, args) -> int:
                 cat2,
                 f"{ln.drive.id}  {job_id} has no discs left. Pick a job for this drive.",
             )
-            board.start()
             if nxt is None:
-                board.set_lane(ln.drive.id, album="", disc=0, discs=0, phase="idle")
+                board.start()
+                board.set_lane(
+                    ln.drive.id,
+                    album="",
+                    disc=0,
+                    discs=0,
+                    phase="idle",
+                    auto=ln.auto,
+                )
                 if note:
                     board.set_note(note)
                 return
+            ln.auto = _resolve_auto(args, nxt)
+            board.start()
             _set_current(cat2, nxt)
             ln.job = nxt
-            _arm_lane(load(cat.path, cat.state_path), board, lanes, ln)
+            _arm_lane(
+                load(cat.path, cat.state_path),
+                board,
+                lanes,
+                ln,
+                allow_loaded=True,
+            )
+            start_ready(False, auto_only=True)
         board.set_note(note or HELP)
 
     def handle_done(drive_id: str, job_id: str, disc: int, status: str, err: str | None) -> None:
@@ -703,9 +807,14 @@ def run_session(cat: Catalog, args) -> int:
         if status == "cancel":
             note = f"{ln.drive.id}  cancelled disc {disc}  — Enter to retry, s to skip"
         elif status == "skip":
-            note = f"{ln.drive.id}  skipped disc {disc}  — load next, then Enter"
+            if ln.auto:
+                note = f"{ln.drive.id}  skipped disc {disc}  — load next (auto-start)"
+            else:
+                note = f"{ln.drive.id}  skipped disc {disc}  — load next, then Enter"
         elif status == "fail":
             note = f"{ln.drive.id}  FAIL disc {disc}  — Enter to retry, s to skip"
+        elif ln.auto:
+            note = f"{ln.drive.id}  load next disc — auto-start when ready"
         else:
             note = HELP
         rearm(ln, job_id, note)
@@ -733,7 +842,11 @@ def run_session(cat: Catalog, args) -> int:
             lock.close()
         if not args.no_eject:
             eject(ln.drive)
-        rearm(ln, job_id, f"{ln.drive.id}  skipped disc {disc}  — load next, then Enter")
+        if ln.auto:
+            hint = f"{ln.drive.id}  skipped disc {disc}  — load next (auto-start)"
+        else:
+            hint = f"{ln.drive.id}  skipped disc {disc}  — load next, then Enter"
+        rearm(ln, job_id, hint)
 
     def change_idle_job() -> None:
         idle = [ln for ln in lanes if ln.wait_load or (not ln.busy and ln.job is None)]
@@ -757,13 +870,33 @@ def run_session(cat: Catalog, args) -> int:
             board.start()
             return
         nxt = pick_job(cat2, f"{target.drive.id}  currently {target.job.id if target.job else 'none'}")
-        board.start()
         if nxt is None:
+            board.start()
             return
+        target.auto = _resolve_auto(args, nxt)
+        board.start()
         _set_current(cat2, nxt)
         target.job = nxt
         target.busy = False
-        _arm_lane(load(cat.path, cat.state_path), board, lanes, target)
+        _arm_lane(
+            load(cat.path, cat.state_path),
+            board,
+            lanes,
+            target,
+            allow_loaded=True,
+        )
+        start_ready(False, auto_only=True)
+
+    def toggle_auto(did: str | None) -> None:
+        target = _pick_lane(board, lanes, did, "no lane to toggle")
+        if target is None:
+            return
+        target.auto = not target.auto
+        board.set_auto(target.drive.id, target.auto)
+        state = "on" if target.auto else "off"
+        board.set_note(f"{target.drive.id}  auto {state}")
+        if target.auto:
+            start_ready(False, auto_only=True)
 
     def abort_inflight() -> None:
         for ln in lanes:
@@ -775,9 +908,11 @@ def run_session(cat: Catalog, args) -> int:
         with ThreadPoolExecutor(max_workers=max(1, len(lanes))) as ex:
             try:
                 for ln in lanes:
-                    _arm_lane(cat, board, lanes, ln)
+                    _arm_lane(cat, board, lanes, ln, allow_loaded=True)
                 if not sys.stdin.isatty():
                     start_ready(True)
+                else:
+                    start_ready(False, auto_only=True)
                 while True:
                     while True:
                         try:
@@ -788,9 +923,19 @@ def run_session(cat: Catalog, args) -> int:
                     now = time.monotonic()
                     if now - last_poll >= 1.0:
                         last_poll = now
+                        want_auto = False
                         for ln in lanes:
-                            if ln.wait_load:
-                                board.set_ready(ln.drive.id, has_media(ln.drive))
+                            if not ln.wait_load:
+                                continue
+                            media = has_media(ln.drive)
+                            ln.auto_ok = note_empty(media, ln.auto_ok)
+                            board.set_ready(
+                                ln.drive.id, media, auto_ok=ln.auto_ok
+                            )
+                            if should_autostart(ln.auto, media, ln.auto_ok):
+                                want_auto = True
+                        if want_auto:
+                            start_ready(False, auto_only=True)
                     busy = any(ln.busy for ln in lanes)
                     waiting = any(ln.wait_load for ln in lanes)
                     if stop and not busy:
@@ -800,12 +945,21 @@ def run_session(cat: Catalog, args) -> int:
                         nxt = pick_job(load(cat.path, cat.state_path), "All drives idle. Pick a job, or q.")
                         if nxt is None:
                             break
+                        auto = _resolve_auto(args, nxt)
                         _set_current(cat, nxt)
                         for ln in lanes:
                             if not ln.busy:
                                 ln.job = nxt
-                                _arm_lane(load(cat.path, cat.state_path), board, lanes, ln)
+                                ln.auto = auto
+                                _arm_lane(
+                                    load(cat.path, cat.state_path),
+                                    board,
+                                    lanes,
+                                    ln,
+                                    allow_loaded=True,
+                                )
                         board.start()
+                        start_ready(False, auto_only=True)
                         continue
                     key = _wait_line(0.25)
                     if key is None:
@@ -843,6 +997,9 @@ def run_session(cat: Catalog, args) -> int:
                     if cmd in ("j", "job"):
                         change_idle_job()
                         continue
+                    if cmd in ("a", "auto"):
+                        toggle_auto(did)
+                        continue
                     if key in cat.jobs or (key.isdigit() and int(key) >= 1):
                         waiting_lanes = [ln for ln in lanes if ln.wait_load]
                         if len(waiting_lanes) == 1:
@@ -854,9 +1011,19 @@ def run_session(cat: Catalog, args) -> int:
                                 board.set_note(HELP)
                                 continue
                             if job:
+                                board.close()
+                                waiting_lanes[0].auto = _resolve_auto(args, job)
+                                board.start()
                                 waiting_lanes[0].job = job
                                 _set_current(cat, job)
-                                _arm_lane(load(cat.path, cat.state_path), board, lanes, waiting_lanes[0])
+                                _arm_lane(
+                                    load(cat.path, cat.state_path),
+                                    board,
+                                    lanes,
+                                    waiting_lanes[0],
+                                    allow_loaded=True,
+                                )
+                                start_ready(False, auto_only=True)
                         continue
                     start_ready(True)
             except BaseException:
